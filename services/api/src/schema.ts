@@ -167,6 +167,10 @@ INSERT INTO break_note_history (asset_id, scope, key, fingerprint, status, note,
   `
 CREATE INDEX actions_due ON actions (record_time) WHERE snapshot IS NULL;
 `,
+  // v4: per-asset register freshness limit. NULL means the stale-register check is off.
+  `
+ALTER TABLE assets ADD COLUMN register_max_age_days INTEGER;
+`,
 ];
 
 /** Identity: who may sign in, and which workspace each session is bound to. */

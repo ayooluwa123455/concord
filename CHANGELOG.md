@@ -40,6 +40,7 @@ Everything to date; Concord's history begins 2026-10 with the commits below.
 
 ### Added
 
+- Per-asset register freshness limits (#561): setting `registerMaxAgeDays` makes `assetSummary` report `registerStale: { ageDays }` once the latest register is older than that many days. Off unless set. Adds `assets.register_max_age_days` (migration v4).
 - CSV templates can include one illustrative example row with `?example=1` or `?example=true` (#200).
 - The accounting core (`feat(core)`, `c402eae`): holdings replay from CAP-67 events, position
   and movement reconciliation with typed breaks, corporate-action entitlements (dividend,

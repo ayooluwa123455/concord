@@ -76,6 +76,8 @@ export interface AssetRecord {
   syncError?: string;
   syncErrorAt?: string;
   ignore: string[];
+  /** Flag the latest register once it is older than this many days. Unset means the check is off. */
+  registerMaxAgeDays?: number;
   createdAt: string;
 }
 
@@ -92,6 +94,8 @@ export interface WatchInput {
   baseline?: boolean;
   /** Addresses outside the register, e.g. the issuer's distribution account. */
   ignore?: string[];
+  /** Flag the latest register once it is older than this many days. Omitted means the check is off. */
+  registerMaxAgeDays?: number;
 }
 
 export type ActionType = "dividend" | "split" | "redemption";
@@ -174,6 +178,15 @@ interface ActionResult {
 const now = () => new Date().toISOString();
 const sha256 = (text: string) => createHash("sha256").update(text).digest("hex");
 const MAX_REGISTER_CLOCK_SKEW_MS = 5 * 60_000;
+const DAY_MS = 86_400_000;
+
+/** A register freshness limit: whole days, long enough to be meaningful and short enough to be sane. */
+function maxAgeDays(value: number): number {
+  if (!Number.isInteger(value) || value < 1 || value > 3650) {
+    throw new Invalid("registerMaxAgeDays must be a whole number of days from 1 to 3650");
+  }
+  return value;
+}
 
 function isoTime(input: string, field: string): string {
   const t = Date.parse(input);
@@ -272,6 +285,9 @@ function toAsset(row: Row): AssetRecord {
     ignore: JSON.parse(String(row.ignore_addresses)) as string[],
     createdAt: String(row.created_at),
   };
+  if (row.register_max_age_days !== null && row.register_max_age_days !== undefined) {
+    asset.registerMaxAgeDays = Number(row.register_max_age_days);
+  }
   if (row.issuer) asset.issuer = String(row.issuer);
   if (row.start_ledger !== null) asset.startLedger = Number(row.start_ledger);
   if (row.baseline_ledger !== null) asset.baselineLedger = Number(row.baseline_ledger);
@@ -314,8 +330,14 @@ export class Concord {
   constructor(
     readonly db: Db,
     readonly networks: Networks,
+    /** Wall clock, in milliseconds. Tests inject one so register age is deterministic. */
+    private readonly options: { now?: () => number } = {},
   ) {
     this.seenVersion = db.dataVersion();
+  }
+
+  private nowMs(): number {
+    return (this.options.now ?? Date.now)();
   }
 
   /** Forget cached holdings for an asset this instance just changed. */
@@ -394,6 +416,8 @@ export class Concord {
       throw new Invalid(`${resolved.code} is already watched`);
     }
     const ignore = addresses(input.ignore, "ignore");
+    const registerMaxAge =
+      input.registerMaxAgeDays === undefined ? undefined : maxAgeDays(input.registerMaxAgeDays);
     let name = label(input.name, "name");
     let decimals = input.decimals;
     if (input.fromLedger !== undefined && (!Number.isInteger(input.fromLedger) || input.fromLedger < 1)) {
@@ -437,8 +461,8 @@ export class Concord {
     }
     try {
       this.db.insert(
-        `INSERT INTO assets (id, network, code, issuer, name, decimals, start_mode, state, start_ledger, ignore_addresses, created_by, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 'indexing', ?, ?, ?, ?)`,
+        `INSERT INTO assets (id, network, code, issuer, name, decimals, start_mode, state, start_ledger, ignore_addresses, register_max_age_days, created_by, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'indexing', ?, ?, ?, ?, ?)`,
         resolved.id,
         input.network,
         resolved.code,
@@ -448,6 +472,7 @@ export class Concord {
         startMode,
         input.fromLedger ?? null,
         JSON.stringify(ignore),
+        registerMaxAge ?? null,
         options.actor?.label ?? null,
         now(),
       );
@@ -519,13 +544,20 @@ export class Concord {
     return this.asset(asset.id);
   }
 
-  updateAsset(ref: string, patch: { name?: string; ignore?: string[] }): AssetRecord {
+  updateAsset(
+    ref: string,
+    patch: { name?: string; ignore?: string[]; registerMaxAgeDays?: number | null },
+  ): AssetRecord {
     const asset = this.asset(ref);
     const name = label(patch.name, "name");
+    let registerMaxAge = asset.registerMaxAgeDays ?? null;
+    if (patch.registerMaxAgeDays === null) registerMaxAge = null;
+    else if (patch.registerMaxAgeDays !== undefined) registerMaxAge = maxAgeDays(patch.registerMaxAgeDays);
     this.db.write(
-      "UPDATE assets SET name = ?, ignore_addresses = ? WHERE id = ?",
+      "UPDATE assets SET name = ?, ignore_addresses = ?, register_max_age_days = ? WHERE id = ?",
       name ?? asset.name,
       JSON.stringify(patch.ignore === undefined ? asset.ignore : addresses(patch.ignore, "ignore")),
+      registerMaxAge,
       asset.id,
     );
     return this.asset(asset.id);
@@ -1814,12 +1846,21 @@ export class Concord {
     const controls = this.controls(asset.id);
     const actions = this.actions(asset.id);
     const events = this.db.get<{ n: number }>("SELECT COUNT(*) AS n FROM events WHERE asset_id = ?", asset.id)!.n;
+    const latestRegister = this.db.get<{ as_of: string }>(
+      "SELECT as_of FROM registers WHERE asset_id = ? ORDER BY as_of DESC, id DESC LIMIT 1",
+      asset.id,
+    );
     return {
       ...asset,
       supply: formatUnits(state.supply, asset.decimals),
       holderCount: state.balances.size,
       eventCount: events,
       incomplete: state.incomplete.length > 0,
+      // A register nobody has refreshed is the attention item a timer-free service cannot raise itself.
+      registerStale:
+        asset.registerMaxAgeDays === undefined || !latestRegister
+          ? null
+          : this.registerAge(latestRegister.as_of, asset.registerMaxAgeDays),
       lastRun: run && { id: run.id, asOf: run.asOf, status: run.status, openBreaks: run.openBreaks },
       openBreaks: {
         reconciliation: run?.openBreaks ?? 0,
@@ -1827,6 +1868,13 @@ export class Concord {
         actions: actions.reduce((n, a) => n + a.openBreaks, 0),
       },
     };
+  }
+
+  /** How far past its limit a register is, or null while it is still fresh enough. */
+  private registerAge(asOf: string, limitDays: number): { ageDays: number } | null {
+    const ageMs = this.nowMs() - Date.parse(asOf);
+    if (!(ageMs > limitDays * DAY_MS)) return null;
+    return { ageDays: Math.floor(ageMs / DAY_MS) };
   }
 
   /** Everything an auditor needs for a period, with a digest over the content. */
