@@ -1,14 +1,122 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { parseArgs } from "node:util";
 import { fileURLToPath } from "node:url";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { openRuntime } from "../src/main.js";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { Auth } from "../src/auth.js";
+import { runCli } from "../src/cli.js";
+import { CLI_OPTIONS, closestFlag, describeArgsError } from "../src/cli-usage.js";
+import { NotFound } from "../src/concord.js";
 import { loadConfig, type Config } from "../src/config.js";
+import { openRuntime } from "../src/main.js";
+import { FAST, at, key } from "./helpers.js";
 
 const tsx = fileURLToPath(import.meta.resolve("tsx/cli"));
 const cliPath = fileURLToPath(new URL("../src/cli.ts", import.meta.url));
+
+/** What the CLI prints for a command line parseArgs refuses. */
+function refusal(args: string[]): string | undefined {
+  try {
+    parseArgs({ args, allowPositionals: true, options: CLI_OPTIONS });
+  } catch (err) {
+    return describeArgsError(err, args);
+  }
+  throw new Error(`parseArgs accepted ${args.join(" ")}`);
+}
+
+describe("closestFlag", () => {
+  it("suggests the flag a typo most likely meant", () => {
+    expect(closestFlag("netwrk")).toBe("network");
+    expect(closestFlag("asof")).toBe("as-of");
+    expect(closestFlag("jsno")).toBe("json");
+    expect(closestFlag("NETWORK")).toBe("network");
+    expect(closestFlag("no-basline")).toBe("no-baseline");
+  });
+
+  it("suggests the only flag that starts with what was typed", () => {
+    expect(closestFlag("dec")).toBe("decimals");
+    expect(closestFlag("pay-")).toBe("pay-asset");
+  });
+
+  it("picks the nearest of several candidates", () => {
+    expect(closestFlag("rato", ["rate", "ratio", "register"])).toBe("rate");
+    expect(closestFlag("ratioo", ["rate", "ratio", "register"])).toBe("ratio");
+  });
+
+  it("suggests nothing when no flag is close", () => {
+    expect(closestFlag("bogus")).toBeUndefined();
+    expect(closestFlag("x")).toBeUndefined();
+    expect(closestFlag("frobnicate")).toBeUndefined();
+    // Shared by more than one flag, so no prefix suggestion either.
+    expect(closestFlag("pa")).toBeUndefined();
+  });
+});
+
+describe("describeArgsError", () => {
+  const hint = "Run 'concord --help' for usage.";
+
+  it("names an unknown flag, with a suggestion when one is close", () => {
+    expect(refusal(["holdings", "X", "--bogus", "1"])).toBe(`unknown option '--bogus'. ${hint}`);
+    expect(refusal(["holdings", "X", "--asof", "2026-10-01"])).toBe(
+      `unknown option '--asof'. Did you mean '--as-of'? ${hint}`,
+    );
+    expect(refusal(["holdings", "X", "--netwrk=testnet"])).toBe(
+      `unknown option '--netwrk'. Did you mean '--network'? ${hint}`,
+    );
+    expect(refusal(["assets", "-z"])).toBe(`unknown option '-z'. ${hint}`);
+  });
+
+  it("says when a flag is missing its value or has one it does not take", () => {
+    expect(refusal(["holdings", "X", "--as-of"])).toBe(`option '--as-of' needs a value. ${hint}`);
+    expect(refusal(["holdings", "X", "--org", "--json"])).toBe(
+      `option '--org' needs a value, not '--json' (write --org=--json if that is the value). ${hint}`,
+    );
+    expect(refusal(["assets", "--json=yes"])).toBe(`option '--json' does not take a value. ${hint}`);
+  });
+
+  it("is one line and never Node's own wording", () => {
+    for (const args of [
+      ["x", "--bogus"],
+      ["x", "--org"],
+      ["x", "--org", "-y"],
+      ["x", "--yes=1"],
+    ]) {
+      const message = refusal(args)!;
+      expect(message).not.toContain("\n");
+      expect(message).not.toMatch(/To specify|ambiguous|argument missing/);
+      expect(message.endsWith(hint)).toBe(true);
+    }
+  });
+
+  it("leaves errors that are not parseArgs refusals to the caller", () => {
+    expect(describeArgsError(new Error("database is locked"), ["assets"])).toBeUndefined();
+    expect(describeArgsError(Object.assign(new Error("x"), { code: "ENOENT" }), ["assets"])).toBeUndefined();
+    expect(describeArgsError(undefined, ["assets"])).toBeUndefined();
+  });
+});
+
+describe("CLI usage errors", { timeout: 30_000 }, () => {
+  it("prints one line to stderr and exits 1 for an unknown flag", () => {
+    const res = spawnSync(process.execPath, [tsx, cliPath, "holdings", "X", "--netwrk", "testnet"], {
+      encoding: "utf8",
+    });
+    expect(res.status).toBe(1);
+    expect(res.stdout).toBe("");
+    const lines = res.stderr
+      .split(/\r?\n/)
+      .filter((line) => line && !/ExperimentalWarning|--trace-warnings/.test(line));
+    expect(lines).toEqual(["unknown option '--netwrk'. Did you mean '--network'? Run 'concord --help' for usage."]);
+  });
+
+  it("still prints the usage text for --help", () => {
+    const res = spawnSync(process.execPath, [tsx, cliPath, "--help"], { encoding: "utf8" });
+    expect(res.status).toBe(0);
+    expect(res.stdout).toContain("concord — reconcile tokenized securities");
+  });
+});
 
 describe("CLI registers and register-delete", { timeout: 30_000 }, () => {
   let dataDir: string;
@@ -169,4 +277,102 @@ describe("CLI registers and register-delete", { timeout: 30_000 }, () => {
     const res = run(["register-delete", assetCode, "99999", "--yes"]);
     expect(res.status).not.toBe(0);
   });
+});
+
+describe("CLI runs and run commands", () => {
+  it("lists reconciliation history with runs, respects --limit, shows run details, and exits 1 on unknown run id", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "concord-cli-555-"));
+    try {
+      const issuer = key();
+      const holder = key();
+      let orgId: string;
+      let run1Id: number;
+      let run2Id: number;
+
+      const rt = openRuntime(loadConfig({ CONCORD_DATA_DIR: dir, CONCORD_SIGNUP: "open" }));
+      try {
+        const fastAuth = new Auth(rt.control, { signup: "open", cost: FAST });
+        const signed = await fastAuth.signUp({
+          email: "runs-cli@example.test",
+          name: "CLI Operator",
+          orgName: "Runs Org",
+          password: "correct horse battery",
+        });
+        orgId = signed.orgId;
+        const ws = rt.tenants.forOrg(orgId);
+        ws.db.insert(
+          `INSERT INTO assets (id, network, code, issuer, name, decimals, start_mode, state, synced_at, synced_ledger, created_at)
+           VALUES ('CASSETRUN', 'testnet', 'FUND', ?, 'Fund', 7, 'window', 'ready', ?, 20, ?)`,
+          issuer,
+          at(20),
+          at(1),
+        );
+        const reg1 = ws.importRegister("FUND", {
+          csv: `holder_id,account,units\nH1,${holder},0\n`,
+          asOf: at(5),
+        });
+        const reg2 = ws.importRegister("FUND", {
+          csv: `holder_id,account,units\nH1,${holder},0\n`,
+          asOf: at(10),
+        });
+        const r1 = await ws.reconcile("FUND", reg1.registerId);
+        const r2 = await ws.reconcile("FUND", reg2.registerId);
+        run1Id = r1.id;
+        run2Id = r2.id;
+      } finally {
+        rt.close();
+      }
+
+      const execCli = async (args: string[]) => {
+        const lines: string[] = [];
+        const spy = vi.spyOn(console, "log").mockImplementation((msg?: unknown) => lines.push(String(msg ?? "")));
+        try {
+          await runCli(args, { CONCORD_DATA_DIR: dir, CONCORD_ORG: orgId });
+          return lines.join("\n");
+        } finally {
+          spy.mockRestore();
+        }
+      };
+
+      const allRuns = JSON.parse(await execCli(["runs", "FUND", "--json"])) as Array<Record<string, unknown>>;
+      expect(allRuns).toHaveLength(2);
+      expect(allRuns[0]).toMatchObject({
+        id: run2Id,
+        asOf: at(10),
+        status: "clean",
+        openBreaks: 0,
+      });
+      expect(allRuns[0]).toHaveProperty("createdAt");
+      expect(allRuns[0]).toHaveProperty("chainBehind");
+      expect(allRuns[0]).toHaveProperty("summary");
+
+      const limited = JSON.parse(await execCli(["runs", "FUND", "--limit", "1", "--json"])) as Array<Record<string, unknown>>;
+      expect(limited).toHaveLength(1);
+      expect(limited[0]!.id).toBe(run2Id);
+
+      const shown = JSON.parse(await execCli(["run", String(run1Id), "--json"])) as Record<string, unknown>;
+      expect(shown).toMatchObject({
+        id: run1Id,
+        asOf: at(5),
+        status: "clean",
+        openBreaks: 0,
+      });
+      expect(shown).toHaveProperty("breaks");
+      expect(shown).toHaveProperty("lines");
+
+      await expect(execCli(["run", "999999", "--json"])).rejects.toThrow(NotFound);
+      await expect(execCli(["run", "999999", "--json"])).rejects.toThrow("reconciliation 999999 not found");
+
+      const tsxCli = createRequire(import.meta.url).resolve("tsx/cli");
+      const cliEntry = fileURLToPath(new URL("../src/cli.ts", import.meta.url));
+      const proc = spawnSync(process.execPath, [tsxCli, cliEntry, "run", "999999"], {
+        env: { ...process.env, CONCORD_DATA_DIR: dir, CONCORD_ORG: orgId },
+        encoding: "utf8",
+      });
+      expect(proc.status).toBe(1);
+      expect(proc.stderr).toContain("reconciliation 999999 not found");
+    } finally {
+      rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+    }
+  }, 15_000);
 });
